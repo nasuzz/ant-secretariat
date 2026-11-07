@@ -166,7 +166,7 @@ unknown
 기본값은 실제 수집 provider입니다.
 
 - `PRICE_DATA_PROVIDER=naver`: Naver Finance 일별 시세를 수집해 `price_data`에 저장
-- `MACRO_DATA_PROVIDER=ecos`: 한국은행 ECOS에서 기준금리, 국고채 금리, CPI를 수집하고 Naver 시장지표에서 USD/KRW를 함께 저장
+- `MACRO_DATA_PROVIDER=ecos`: 한국은행 ECOS에서 기준금리, 국고채 3·10년 금리, CPI, USD/KRW 환율, 유가(WTI·Dubai·Brent 월평균), 통관 수출·수입과 무역수지(수출 − 수입), 전산업생산지수(계절조정)를 수집
 - `MACRO_DATA_PROVIDER=naver`: Naver 시장지표에서 USD/KRW만 수집
 
 실제 수치 데이터까지 포함해 실행:
@@ -177,6 +177,57 @@ python main.py --run-once --source naver --include-price-data --include-macro-da
 
 ECOS 수집에는 `ECOS_API_KEY`가 필요합니다. 네트워크가 없는 테스트 환경에서는 `.env`에서 `PRICE_DATA_PROVIDER=mock`,
 `MACRO_DATA_PROVIDER=mock`으로 바꿀 수 있습니다. 추후 한국투자 Open API 같은 provider로 교체할 수 있도록 `collectors/`에 provider 경계를 두었습니다.
+
+Supabase `macro_data` 테이블 적재(`SUPABASE_DB_URL`, `ECOS_API_KEY` 필요):
+
+```bash
+python -m crawling.macro_loader --backfill   # 2000년부터 전체 이력
+python -m crawling.macro_loader --daily      # 최근 구간(일별 45일, 월별 400일) 갱신
+```
+
+DART 주요 재무계정(`financials`)과 파생 지표 뷰(`financial_metrics`: 부채비율, 영업이익률, 매출 성장률 YoY, ROE TTM) 적재:
+
+```bash
+python -m crawling.financials_loader --backfill   # 최근 3개 사업연도 + 올해
+python -m crawling.financials_loader --recent     # 작년·올해 다시 받기 (분기 공시 시즌에 주 1회)
+```
+
+- 손익 항목의 `amount`는 분기 단독(3개월), `amount_ytd`는 연초부터 누적. 4분기 단독은 연간 − 3분기 누적
+- 시점 관리: 정정공시가 와도 덮어쓰지 않고 접수번호(`rcept_no`)별로 쌓는다. `rcept_dt`는 접수일. 현재 기준 최신 값은 뷰 `financials_latest`, 과거 시점 기준은 함수 `financials_as_of('YYYY-MM-DD')`
+- 4분기 손익은 사업보고서와 3분기 보고서 중 더 늦게 접수된 쪽의 접수번호를 쓴다(3분기가 나중에 정정되면 4분기도 새 버전으로 쌓임)
+- DART는 최신 버전만 주므로, 원래 값을 남기려면 공시 시즌에 정정이 나오기 전에 받아 두어야 한다
+- 지표는 연결재무제표 우선, 없으면 별도. ROE는 지배주주 귀속분이 아닌 전체 당기순이익 기준
+- 은행·보험·증권은 DART 주요계정에 매출액이 없어 매출 관련 지표가 비고, 부채비율은 업종 특성상 1,000%를 넘는다
+
+WICS 섹터 분류(`companies.sector_l1` 대분류, `sector_l2` 중분류) 갱신. 분류는 자주 바뀌지 않아 주 1회면 충분합니다:
+
+```bash
+python -m crawling.market_loader --sectors
+```
+
+wiseindex.com의 robots.txt는 일반 크롤러를 허용하지 않으므로 팀 내부 테스트 범위에서만 사용합니다. 우선주는 보통주 분류를 따르고, 코넥스·외국기업 등 WICS 미편입 종목은 비워 둡니다.
+
+KIS 목표주가·투자의견(`broker_opinions`) 적재(`KIS_APP_KEY`, `KIS_APP_SECRET` 필요). 조회 API만 호출합니다:
+
+```bash
+python -m crawling.opinions_loader --backfill   # T1/T2, 최근 12개월
+python -m crawling.opinions_loader --recent     # T1/T2, 최근 14일 다시 받기 (매일)
+```
+
+- `opinion`은 증권사 원래 표기, `opinion_norm`은 buy/hold/sell로 통일한 값. NotRated 등은 null
+- `target_price`는 발표 당시 기준. 분할을 환산한 값은 뷰 `broker_opinions_adjusted`의 `target_price_adjusted`
+- 분할 판별(`stock_split_events`): 주식수 1.5배 이상 또는 0.5배 이하이면서 시가총액 변화가 0.8~1.25배. 무상증자처럼 권리락일과 신주 상장일이 다른 경우는 잡히지 않을 수 있음
+
+시뮬레이션 파라미터(`sim_params`, GJR-GARCH + FHS)와 민감도(`sensitivities`) 적합. 시세·지수·매크로 적재 후 실행:
+
+```bash
+python -m crawling.sim_loader                     # T1/T2 종목, 최신 거래일 기준 최근 3년
+python -m crawling.sim_loader --tickers 005930    # 특정 종목만
+```
+
+- `sim_params.params_json`: 계수(omega·alpha·gamma·beta), 다음날 조건부 분산, 표준화 잔차(`std_resid`), 30일 예상 변동성. 경로 생성은 `crawling.analytics.garch.simulate_paths` 참고
+- `status=not_converged`이면 `params_json.status_reason`이 `optimizer_failed`(최적화 실패) 또는 `nonstationary`(지속성 ≥ 1)
+- `sensitivities`: 요인(KOSPI·USD_KRW·KTB_3Y_KR)이 30거래일 동안 1σ 움직일 때 종목 30일 수익률(%) 변화. `multi`는 세 요인 동시 회귀, `simple`은 단일 요인 회귀, `corr_daily`는 일별 상관계수(온톨로지 엣지 가중치)
 
 ## 뉴스 / 공시 Provider
 
